@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Hatch / pip
+.hatch/
+pip-wheel-metadata/
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Data — large files should not be committed
+data/
+*.npy
+*.h5
+*.hdf5
+*.fits
+*.pt
+*.pth
+
+# Exceptions: bundled test data
+!cosmo_vgg/data/
+
+# Logs / outputs
+*.log
+runs/
+checkpoints/
+outputs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
