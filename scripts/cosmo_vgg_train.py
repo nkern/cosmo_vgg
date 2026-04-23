@@ -1,18 +1,9 @@
 #!/usr/bin/env python
 
 import argparse
-import math
-from pathlib import Path
 
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from cosmo_vgg import models
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Cosmological encoder (2D/3D)')
@@ -61,8 +52,38 @@ if __name__ == '__main__':
     args = parse_args()
 
     if args.mode == 'train':
-        train(args)
+        models.train(
+            data_dir=args.data_dir,
+            checkpoint=args.checkpoint,
+            resolution=args.resolution,
+            in_channels=args.in_channels,
+            base_channels=args.base_channels,
+            embed_dim=args.embed_dim,
+            attn_heads=args.attn_heads,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            warmup_steps=args.warmup_steps,
+            regression_weight=args.regression_weight,
+            num_workers=args.num_workers,
+            noise_std=args.noise_std,
+            kspace_mask_prob=args.kspace_mask_prob,
+            twodim=args.twodim,
+            thin_factor=args.thin_factor,
+        )
     elif args.mode == 'embed':
-        embed(args)
+        models.embed(
+            checkpoint=args.checkpoint,
+            data_dir=args.data_dir,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )
     elif args.mode == 'fid':
-        compute_fid(args)
+        models.compute_fid(
+            checkpoint=args.checkpoint,
+            train_dir=args.train_dir,
+            gen_dir=args.gen_dir,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        )

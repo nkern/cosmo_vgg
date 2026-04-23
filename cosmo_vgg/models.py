@@ -674,23 +674,6 @@ class VGGEncoder2D(nn.Module):
         return z
 
 
-def build_encoder(args):
-    """Construct the appropriate encoder based on the --twodim flag."""
-    if args.twodim:
-        return VGGEncoder2D(
-            in_channels=1,  # one channel per 2D slice
-            base_channels=args.base_channels,
-            embed_dim=args.embed_dim,
-            attn_heads=args.attn_heads,
-        )
-    else:
-        return VGGEncoder3D(
-            in_channels=args.in_channels,
-            base_channels=args.base_channels,
-            embed_dim=args.embed_dim,
-            attn_heads=args.attn_heads,
-        )
-
 
 def encode_batch(encoder, x_batch, twodim, thin_factor):
     """
@@ -971,40 +954,115 @@ def novelty_scores(z_new, z_train, k=5):
 # Training loop
 # ---------------------------------------------------------------------------
 
-def train(args):
+def train(
+    data_dir: str,
+    checkpoint: str = "encoder.pt",
+    resolution: int = 64,
+    in_channels: int = 1,
+    base_channels: int = 32,
+    embed_dim: int = 256,
+    attn_heads: int = 8,
+    epochs: int = 100,
+    batch_size: int = 16,
+    lr: float = 3e-4,
+    weight_decay: float = 1e-4,
+    warmup_steps: int = 500,
+    regression_weight: float = 0.1,
+    num_workers: int = 4,
+    noise_std: float = 0.05,
+    kspace_mask_prob: float = 0.3,
+    twodim: bool = False,
+    thin_factor: int = 8,
+):
+    """
+    Train a VGG+attention encoder on CAMELS cosmological fields using VICReg.
+
+    Loads .npy grids from ``data_dir``, builds a positive-pair dataset grouped
+    by (Om, s8) cosmology, and optimises a
+    ``CosmologicalEncoderModel`` with VICReg contrastive loss plus an optional
+    parameter regression head.  The best checkpoint (lowest total loss) is
+    written to ``checkpoint``.
+
+    Scheduler: linear warmup for ``warmup_steps`` steps followed by cosine
+    annealing to zero over the remainder of training.  Gradients are clipped
+    to unit norm each step.
+
+    Args:
+        data_dir:          Path to directory containing ``*.npy`` CAMELS grids.
+        checkpoint:        Output path for the best model checkpoint.
+        resolution:        Spatial resolution to resize each input cube to
+                           (applied along all three axes).
+        in_channels:       Number of input field channels (3D mode only).
+        base_channels:     Number of filters in the first encoder block;
+                           doubles with each subsequent block.
+        embed_dim:         Dimensionality of the output embedding vector.
+        attn_heads:        Number of self-attention heads.
+        epochs:            Total number of training epochs.
+        batch_size:        Samples per gradient step.  ``drop_last=True`` so
+                           the final incomplete batch is discarded.
+        lr:                Peak learning rate for AdamW.
+        weight_decay:      L2 regularisation coefficient for AdamW.
+        warmup_steps:      Number of gradient steps for the linear LR warmup.
+        regression_weight: Weight applied to the cosmological parameter
+                           regression loss relative to VICReg.  Set to 0 to
+                           disable regression entirely.
+        num_workers:       DataLoader worker processes for parallel I/O.
+        noise_std:         Standard deviation of additive Gaussian noise
+                           applied during augmentation.
+        kspace_mask_prob:  Probability of applying k-space high-frequency
+                           masking to each sample during augmentation.
+        twodim:            If ``True``, thin the D axis by ``thin_factor`` and
+                           encode each depth slice independently with a 2D
+                           encoder, then average slice embeddings per volume.
+        thin_factor:       Stride used to subsample the D axis in 2D mode.
+    """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
-    print(f'Mode: {"2D" if args.twodim else "3D"}')
+    print(f'Mode: {"2D" if twodim else "3D"}')
 
     augment = CosmologicalAugment(
-        noise_std=args.noise_std,
-        kspace_mask_prob=args.kspace_mask_prob,
-        twodim=args.twodim,
+        noise_std=noise_std,
+        kspace_mask_prob=kspace_mask_prob,
+        twodim=twodim,
     )
 
     dataset = CAMELSDataset(
-        data_dir=args.data_dir,
-        resolution=args.resolution,
+        data_dir=data_dir,
+        resolution=resolution,
         transform=augment,
-        twodim=args.twodim,
-        thin_factor=args.thin_factor,
+        twodim=twodim,
+        thin_factor=thin_factor,
     )
     dataloader = DataLoader(
         dataset,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=args.num_workers,
+        num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
     )
 
-    encoder = build_encoder(args)
+    if twodim:
+        encoder = VGGEncoder2D(
+            in_channels=1,
+            base_channels=base_channels,
+            embed_dim=embed_dim,
+            attn_heads=attn_heads,
+        )
+    else:
+        encoder = VGGEncoder3D(
+            in_channels=in_channels,
+            base_channels=base_channels,
+            embed_dim=embed_dim,
+            attn_heads=attn_heads,
+        )
+
     model = CosmologicalEncoderModel(
         encoder=encoder,
-        embed_dim=args.embed_dim,
-        regression_weight=args.regression_weight,
-        twodim=args.twodim,
-        thin_factor=args.thin_factor,
+        embed_dim=embed_dim,
+        regression_weight=regression_weight,
+        twodim=twodim,
+        thin_factor=thin_factor,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1012,16 +1070,15 @@ def train(args):
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
+        lr=lr,
+        weight_decay=weight_decay,
     )
 
     def lr_lambda(step):
-        warmup = args.warmup_steps
-        total = args.epochs * len(dataloader)
-        if step < warmup:
-            return step / max(1, warmup)
-        progress = (step - warmup) / max(1, total - warmup)
+        total = epochs * len(dataloader)
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total - warmup_steps)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
@@ -1029,18 +1086,18 @@ def train(args):
     best_loss = float('inf')
     global_step = 0
 
-    for epoch in range(args.epochs):
+    for epoch in range(epochs):
         model.train()
         epoch_logs = {}
 
         for batch in dataloader:
-            x_a, x_b, params = batch
+            x_a, x_b, params_batch = batch
             x_a = x_a.to(device)
             x_b = x_b.to(device)
-            params = params.to(device) if args.regression_weight > 0 else None
+            params_batch = params_batch.to(device) if regression_weight > 0 else None
 
             optimizer.zero_grad()
-            loss, logs = model(x_a, x_b, params)
+            loss, logs = model(x_a, x_b, params_batch)
             loss.backward()
 
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -1055,14 +1112,14 @@ def train(args):
         epoch_logs = {k: v / n_batches for k, v in epoch_logs.items()}
 
         total = epoch_logs.get('loss/total', 0)
-        lr = scheduler.get_last_lr()[0]
+        current_lr = scheduler.get_last_lr()[0]
         print(
-            f'Epoch {epoch+1:4d}/{args.epochs} | '
+            f'Epoch {epoch+1:4d}/{epochs} | '
             f'loss={total:.4f} | '
             f'inv={epoch_logs.get("vicreg/inv", 0):.4f} | '
             f'var={epoch_logs.get("vicreg/var", 0):.4f} | '
             f'cov={epoch_logs.get("vicreg/cov", 0):.4f} | '
-            f'lr={lr:.2e}'
+            f'lr={current_lr:.2e}'
         )
 
         if total < best_loss:
@@ -1072,10 +1129,18 @@ def train(args):
                     'epoch': epoch,
                     'model_state': model.state_dict(),
                     'encoder_state': encoder.state_dict(),
-                    'args': vars(args),
                     'loss': best_loss,
+                    'config': {
+                        'in_channels': in_channels,
+                        'base_channels': base_channels,
+                        'embed_dim': embed_dim,
+                        'attn_heads': attn_heads,
+                        'resolution': resolution,
+                        'twodim': twodim,
+                        'thin_factor': thin_factor,
+                    },
                 },
-                args.checkpoint,
+                checkpoint,
             )
             print(f'  -> Saved checkpoint (loss={best_loss:.4f})')
 
@@ -1084,32 +1149,68 @@ def train(args):
 # Embedding extraction
 # ---------------------------------------------------------------------------
 
-def embed(args):
+def embed(
+    checkpoint: str,
+    data_dir: str,
+    batch_size: int = 16,
+    num_workers: int = 4,
+):
+    """
+    Extract and save embeddings for all grids in ``data_dir`` using a trained
+    checkpoint.
+
+    Loads the model architecture and hyperparameters from ``checkpoint``,
+    runs the encoder over every sample in ``data_dir`` in evaluation mode
+    (no gradients), and writes the result to ``<data_dir>/embeddings.npy``.
+
+    Args:
+        checkpoint:  Path to a ``.pt`` checkpoint produced by :func:`train`.
+        data_dir:    Directory of ``.npy`` CAMELS grids to embed.  Resolution,
+                     2D/3D mode, and thin factor are read from the checkpoint
+                     so they match the training configuration automatically.
+        batch_size:  Number of volumes to encode per forward pass.
+        num_workers: DataLoader worker processes for parallel I/O.
+    """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    ckpt = torch.load(args.checkpoint, map_location=device)
-    ckpt_args = argparse.Namespace(**ckpt['args'])
+    ckpt = torch.load(checkpoint, map_location=device)
+    cfg = ckpt['config']
 
-    encoder = build_encoder(ckpt_args)
+    if cfg['twodim']:
+        encoder = VGGEncoder2D(
+            in_channels=1,
+            base_channels=cfg['base_channels'],
+            embed_dim=cfg['embed_dim'],
+            attn_heads=cfg['attn_heads'],
+        )
+    else:
+        encoder = VGGEncoder3D(
+            in_channels=cfg['in_channels'],
+            base_channels=cfg['base_channels'],
+            embed_dim=cfg['embed_dim'],
+            attn_heads=cfg['attn_heads'],
+        )
+
     model = CosmologicalEncoderModel(
         encoder=encoder,
-        embed_dim=ckpt_args.embed_dim,
-        twodim=ckpt_args.twodim,
-        thin_factor=ckpt_args.thin_factor,
+        embed_dim=cfg['embed_dim'],
+        twodim=cfg['twodim'],
+        thin_factor=cfg['thin_factor'],
     )
     model.load_state_dict(ckpt['model_state'])
     model.to(device).eval()
 
     dataset = CAMELSDataset(
-        data_dir=args.data_dir,
-        resolution=ckpt_args.resolution,
-        twodim=ckpt_args.twodim,
-        thin_factor=ckpt_args.thin_factor,
+        data_dir=data_dir,
+        resolution=cfg['resolution'],
+        twodim=cfg['twodim'],
+        thin_factor=cfg['thin_factor'],
     )
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers)
 
     embeddings = compute_embeddings(model, dataloader, device)
-    out_path = Path(args.data_dir) / 'embeddings.npy'
+    out_path = Path(data_dir) / 'embeddings.npy'
     np.save(out_path, embeddings)
     print(f'Saved {embeddings.shape} embeddings to {out_path}')
 
@@ -1118,33 +1219,84 @@ def embed(args):
 # FID computation
 # ---------------------------------------------------------------------------
 
-def compute_fid(args):
+def compute_fid(
+    checkpoint: str,
+    train_dir: str,
+    gen_dir: str,
+    batch_size: int = 16,
+    num_workers: int = 4,
+    novelty_samples: int = 5,
+) -> float:
+    """
+    Compute the Fréchet Inception Distance (FID) between a training set and a
+    generated set of cosmological fields, using embeddings from a trained encoder.
+
+    Both sets are embedded with the model from ``checkpoint``.  Gaussian
+    distributions are fit to each embedding set using Ledoit-Wolf shrinkage
+    covariance (more stable than sample covariance when the number of samples
+    is not much larger than the embedding dimension).  FID is then the Fréchet
+    distance between those two Gaussians.
+
+    Additionally prints per-sample novelty scores (Mahalanobis distance, max
+    cosine similarity, and k-NN distance) for the first ``novelty_samples``
+    generated volumes to help diagnose memorisation or out-of-distribution
+    behaviour.
+
+    Args:
+        checkpoint:       Path to a ``.pt`` checkpoint produced by :func:`train`.
+        train_dir:        Directory of reference (training) ``.npy`` grids.
+        gen_dir:          Directory of generated ``.npy`` grids to evaluate.
+        batch_size:       Volumes per forward pass during embedding.
+        num_workers:      DataLoader worker processes for parallel I/O.
+        novelty_samples:  Number of generated samples for which to print
+                          per-sample novelty diagnostics.
+
+    Returns:
+        fid: Fréchet distance between the training and generated embedding
+             distributions.  Lower is better; 0 means identical distributions.
+    """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    ckpt = torch.load(args.checkpoint, map_location=device)
-    ckpt_args = argparse.Namespace(**ckpt['args'])
+    ckpt = torch.load(checkpoint, map_location=device)
+    cfg = ckpt['config']
 
-    encoder = build_encoder(ckpt_args)
+    if cfg['twodim']:
+        encoder = VGGEncoder2D(
+            in_channels=1,
+            base_channels=cfg['base_channels'],
+            embed_dim=cfg['embed_dim'],
+            attn_heads=cfg['attn_heads'],
+        )
+    else:
+        encoder = VGGEncoder3D(
+            in_channels=cfg['in_channels'],
+            base_channels=cfg['base_channels'],
+            embed_dim=cfg['embed_dim'],
+            attn_heads=cfg['attn_heads'],
+        )
+
     model = CosmologicalEncoderModel(
         encoder=encoder,
-        embed_dim=ckpt_args.embed_dim,
-        twodim=ckpt_args.twodim,
-        thin_factor=ckpt_args.thin_factor,
+        embed_dim=cfg['embed_dim'],
+        twodim=cfg['twodim'],
+        thin_factor=cfg['thin_factor'],
     )
     model.load_state_dict(ckpt['model_state'])
     model.to(device).eval()
 
-    res = ckpt_args.resolution
-    twodim = ckpt_args.twodim
-    thin = ckpt_args.thin_factor
+    res = cfg['resolution']
+    twodim = cfg['twodim']
+    thin = cfg['thin_factor']
 
-    train_ds = CAMELSDataset(data_dir=args.train_dir, resolution=res,
+    train_ds = CAMELSDataset(data_dir=train_dir, resolution=res,
                               twodim=twodim, thin_factor=thin)
-    gen_ds = CAMELSDataset(data_dir=args.gen_dir, resolution=res,
+    gen_ds = CAMELSDataset(data_dir=gen_dir, resolution=res,
                             twodim=twodim, thin_factor=thin)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=False)
-    gen_loader = DataLoader(gen_ds, batch_size=args.batch_size, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False,
+                               num_workers=num_workers)
+    gen_loader = DataLoader(gen_ds, batch_size=batch_size, shuffle=False,
+                             num_workers=num_workers)
 
     print('Embedding training set...')
     z_train = compute_embeddings(model, train_loader, device)
@@ -1158,8 +1310,8 @@ def compute_fid(args):
     fid = frechet_distance(mu_train, sigma_train, mu_gen, sigma_gen)
     print(f'\nFID: {fid:.4f}')
 
-    print('\nNovelty scores (first 5 generated samples):')
-    for i in range(min(5, len(z_gen))):
+    print(f'\nNovelty scores (first {novelty_samples} generated samples):')
+    for i in range(min(novelty_samples, len(z_gen))):
         scores = novelty_scores(z_gen[i], z_train)
         print(f'  Sample {i}: {scores}')
 
