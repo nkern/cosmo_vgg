@@ -39,6 +39,7 @@ data/
 
 # Exceptions: bundled test data
 !cosmo_vgg/data/
+!cosmo_vgg/data/*.npy
 
 # Logs / outputs
 *.log
