@@ -9,15 +9,13 @@ description = "VGG + attention encoder for cosmological simulation latent spaces
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Nicholas Kern", email = "nkern.astro@gmail.com" }]
-dependencies = [
+
+[project.optional-dependencies]
+dev = [
     "torch>=2.1",
     "numpy>=1.24",
     "scikit-learn>=1.3",
     "scipy>=1.11",
-]
-
-[project.optional-dependencies]
-dev = [
     "pytest>=7.4",
     "pytest-cov>=4.1",
 ]
